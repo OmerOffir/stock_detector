@@ -317,11 +317,21 @@ class PatternDirector:
         lines.append(f"  Entry : {f(best.entry)}")
         lines.append(f"  Stop  : {f(best.stop)}")
         lines.append(f"  Target: {f(best.target)}")
+
+        # Risk/Reward
+        rr_val = self._rr(best)
+        if rr_val is not None:
+            lines.append(f"  R/R   : {rr_val:.2f}R")
+
+        # Buffers
         if best.entry and best.stop:
             lines.append(f"  Buffers -> ATR14={last_atr:.2f}, min_pct_buffer={self.pct_buf*100:.2f}% (use >= {buff:.2f})")
-        wt = self._watch_text(best)
-        if wt:
-            lines.append(f"  {wt}")
+
+        # Next Step (works for both PENDING and VALID if not yet triggered)
+        price_now = float(df['close'].iloc[-1])
+        ns = self._next_step_text(best, price_now)
+        if ns:
+            lines.append(f"  Next  : {ns}")
 
         # bullets (actionable only)
         for p in actionable_charts:
@@ -452,6 +462,22 @@ class PatternDirector:
         c_o = self._val(cur["open"]);   c_c = self._val(cur["close"])
         return (p_c > p_o) and (c_c < c_o) and (c_o >= p_c) and (c_c <= p_o)
 
+    def _doji_breakout_plan(self, row, date, df, last_close):
+        hi  = self._val(row["high"])
+        lo  = self._val(row["low"])
+        atr = float(df["atr14"].loc[date])
+        ref = self._val(row["close"])
+
+        # Reuse your inside-bar logic: entry=hi+buf, stop=lo-buf, target = entry + 2R
+        entry, stop, target = self._levels_for_inside_bullish(
+            hi, lo, atr, ref, r_mult=2.0, atr_buf_mult=0.25
+        )
+
+        cancel_now = last_close < lo
+        status = self._status_for_signal(cancel_now, signal_is_today=(date == df.index[-1]))
+        return self.Plan("Doji Breakout", "bull", "CANDLE", date, entry, stop, target, cancel_now, status, "single")
+
+
     def _latest_candle_plan(self, df: pd.DataFrame) -> Tuple[List["PatternDirector.Plan"], List["PatternDirector.Plan"]]:
         plans: List["PatternDirector.Plan"] = []
         bears_info: List["PatternDirector.Plan"] = []
@@ -487,7 +513,8 @@ class PatternDirector:
             date = df.index[i]
             if self._is_shooting_star(o,h,l,c): add("Shooting Star","bear", h,l,date,"single")
             if self._is_hammer(o,h,l,c):        add("Hammer","bull", h,l,date,"single")
-            if self._is_doji(o,h,l,c):          add("Doji","neutral",h,l,date,"single")
+            if self._is_doji(o,h,l,c):          
+                plans.append(self._doji_breakout_plan(row, date, df, last_close))
             if self._is_bullish_engulfing(prv, row): add("Bullish Engulfing","bull", h,l,date,"2-bar")
             if self._is_bearish_engulfing(prv, row): add("Bearish Engulfing","bear", h,l,date,"2-bar")
 
@@ -957,6 +984,39 @@ class PatternDirector:
         return big_bear and inside_all and small_counter and \
             self._is_bear(cur["open"], cur["close"]) and (self._f(cur["close"]) < self._f(p4["low"]))
 
+    def _rr(self, p: "PatternDirector.Plan") -> Optional[float]:
+        if p.entry is None or p.stop is None or p.target is None:
+            return None
+        if p.side == "bull":
+            risk   = max(p.entry - p.stop, 1e-9)
+            reward = p.target - p.entry
+        else:
+            risk   = max(p.stop - p.entry, 1e-9)
+            reward = p.entry - p.target
+        return float(reward / risk)
+
+    def _next_step_text(self, p: "PatternDirector.Plan", price: Optional[float]) -> str:
+        # If we don't have levels, nothing actionable to say.
+        if p.entry is None or p.stop is None or p.target is None:
+            # For pure-neutral candles you could return a generic hint, but we prefer silence.
+            return ""
+
+        # Prefer a real-time price if caller didn't provide one
+        if price is None:
+            return f"Arm a buy-stop at {p.entry:.2f}; initial stop {p.stop:.2f}; target {p.target:.2f}. Cancel if close < {p.stop:.2f}."
+
+        # Bull logic (default in your long-only flow)
+        if p.side == "bull":
+            if price < p.entry:
+                return f"Set buy-stop {p.entry:.2f}; stop {p.stop:.2f}; target {p.target:.2f}. Cancel if close < {p.stop:.2f}."
+            else:
+                return f"Triggered above {p.entry:.2f}. Manage toward {p.target:.2f}; exit if close < {p.stop:.2f}."
+        else:
+            # For completeness if you enable shorts
+            if price > p.entry:
+                return f"Set sell-stop {p.entry:.2f}; stop {p.stop:.2f}; target {p.target:.2f}. Cancel if close > {p.stop:.2f}."
+            else:
+                return f"Triggered below {p.entry:.2f}. Manage toward {p.target:.2f}; exit if close > {p.stop:.2f}."
 
 
 if __name__ == "__main__":
