@@ -53,10 +53,17 @@ class BotManager:
                   f"(in {self._fmt_tdelta(nxt - now)})")
 
     async def run_forever(self):
-        """Only needed if you don't already have a Discord client loop running."""
         self.start()
         while True:
-            await asyncio.sleep(3600)
+            job = self.scheduler.get_job("pattern_daily")
+            if job and job.next_run_time:
+                nxt = job.next_run_time.astimezone(self.tz)
+                now = datetime.now(self.tz)
+                remaining = self._fmt_tdelta(nxt - now)
+                # \r rewinds the cursor to overwrite the same line
+                print(f"\r[pattern_bot] next run at {nxt:%Y-%m-%d %H:%M %Z} "
+                    f"(in {remaining})", end="", flush=True)
+            await asyncio.sleep(1)  # update every second
 
 
 if __name__ == "__main__":
