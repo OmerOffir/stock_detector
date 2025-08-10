@@ -1,0 +1,6 @@
+{
+  "tickers": ["AAPL", "MSFT", "NVDA", "AMZN"],
+  "period": "1y",
+  "interval": "1d",
+  "risk": { "atr_mult": 1.0, "percent_buffer": 0.0025 }
+}
