@@ -8,6 +8,11 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import warnings
+
+# Quiet the noisy library warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 
 class PatternDirector:
@@ -54,6 +59,17 @@ class PatternDirector:
         self.interval: str = cfg["interval"]
         self.atr_mult: float = float(cfg["risk"].get("atr_mult", 1.0))
         self.pct_buf: float = float(cfg["risk"].get("percent_buffer", 0.0025))
+        self.long_only: bool = bool(cfg.get("long_only", True))
+        self.relevance = {
+            "fresh_breakout_max_atr": 0.75,   # how far above entry a breakout can be and still be 'fresh'
+            "fresh_breakout_max_pct": 0.01,   # or within 1% of entry
+            "max_beyond_target_pct": 0.0025  # if price basically tagged target, hide
+        }
+        mom = cfg.get("momentum_filter", {})
+        self.min_rr_ok =  float(cfg["min_rr_ok"])
+        self.rsi_min  = float(mom.get("rsi_min", 50))
+        self.rsi_hot  = float(mom.get("rsi_hot", 80))
+        self.macd_hist_rising_window = int(mom.get("macd_hist_rising_window", 3))
 
     # --------------- Public API ---------------
 
@@ -65,41 +81,55 @@ class PatternDirector:
                 print(f"[{t}] ERROR: {e}")
                 continue
 
-            # Chart patterns near present
+            # --- raw detections ---
             chart_plans: List[PatternDirector.Plan] = []
             for detector in (self._detect_cup_and_handle,
-                             self._detect_double_bottom,
-                             self._detect_head_and_shoulders):
+                            self._detect_double_bottom,
+                            self._detect_head_and_shoulders):
                 try:
                     plan = detector(df)
-                    if plan:
+                    if plan and self._allow(plan.side):   # ⬅️ only keep longs/neutral
                         chart_plans.append(plan)
                 except Exception:
-                    # Avoid a single detector killing the run
                     pass
 
-            # Candlesticks for last two bars w/ present cancel
             candle_plans = self._latest_candle_plan(df)
 
-            best = self._choose_best_plan(chart_plans, candle_plans)
+            # --- relevance filter (keep only actionable-now) ---
+            actionable_charts, actionable_candles = [], []
+            for p in chart_plans:
+                ok, why = self._is_actionable_now(p, df)
+                if ok:
+                    actionable_charts.append(p)
+                else:
+                    p.notes = (p.notes + f" | filtered:{why}").strip()
+
+            for c in candle_plans:
+                ok, why = self._is_actionable_now(c, df)
+                if ok:
+                    actionable_candles.append(c)
+                else:
+                    c.notes = (c.notes + f" | filtered:{why}").strip()
+
+            best = self._choose_best_plan(actionable_charts, actionable_candles)
 
             print(f"\n=== {t} — Present Pattern Director ({self.period}, {self.interval}) ===")
             if best:
                 self._print_best(df, best)
             else:
-                print("No actionable setup now. (Everything either stale or canceled.)")
+                print("No actionable setup now. (Everything either stale, late, or canceled.)")
 
-            # Context
-            for p in chart_plans:
+            # Optional: print only actionable context (clean output)
+            for p in actionable_charts:
                 print(f"  • {p.pattern:16} {p.state:12} {p.status:12} "
-                      f"entry={p.entry and round(p.entry,2)} stop={p.stop and round(p.stop,2)}")
-            for c in candle_plans:
-                # only show the last two bars (already the case), keep line for clarity
+                    f"entry={p.entry and round(p.entry,2)} stop={p.stop and round(p.stop,2)}")
+            for c in actionable_candles:
                 print(f"  • Candle {c.pattern:16} {c.state:12} {c.status:12} ({c.notes})")
 
     # --------------- Config / Data ---------------
 
     def _load_config(self, json_path: str | Path) -> Dict:
+        json_path = Path(json_path)
         with open(json_path, "r", encoding="utf-8") as f:
             raw = json.load(f)
         return self._normalize_config(raw)
@@ -110,6 +140,7 @@ class PatternDirector:
         raw.setdefault("period", "1y")
         raw.setdefault("interval", "1d")
         raw.setdefault("risk", {"atr_mult": 1.0, "percent_buffer": 0.0025})
+        raw.setdefault("long_only", True)
         return raw
 
     def _get_history(self, ticker: str, period: str, interval: str) -> pd.DataFrame:
@@ -119,6 +150,8 @@ class PatternDirector:
             raise ValueError(f"No data for {ticker}.")
         df = df.rename(columns=str.lower).dropna()
         df["atr14"] = self._atr(df, 14)
+        df["rsi14"] = self._rsi(df["close"], 14)
+        df["macd"], df["macd_signal"], df["macd_hist"] = self._macd(df["close"])
         return df
 
     def _atr(self, df: pd.DataFrame, n: int = 14) -> pd.Series:
@@ -126,6 +159,43 @@ class PatternDirector:
         prev_c = c.shift(1)
         tr = pd.concat([(h - l), (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
         return tr.rolling(n, min_periods=n).mean()
+
+    def _rsi(self, close: pd.Series, n: int = 14) -> pd.Series:
+        delta = close.diff()
+        up = delta.clip(lower=0.0)
+        down = -delta.clip(upper=0.0)
+        roll_up = up.ewm(alpha=1/n, adjust=False).mean()
+        roll_down = down.ewm(alpha=1/n, adjust=False).mean()
+        rs = roll_up / (roll_down + 1e-9)
+        return 100 - (100 / (1 + rs))
+
+    def _macd(self, close: pd.Series, fast=12, slow=26, signal=9):
+        ema_fast = close.ewm(span=fast, adjust=False).mean()
+        ema_slow = close.ewm(span=slow, adjust=False).mean()
+        macd = ema_fast - ema_slow
+        sig = macd.ewm(span=signal, adjust=False).mean()
+        hist = macd - sig
+        return macd, sig, hist
+
+
+    def _levels_for_inside_bullish(self, hi, lo, atr_now, ref_price, r_mult=2.0, atr_buf_mult=0.25):
+        """
+        Buy-stop above inside bar high; stop just below inside bar low; target = r_mult * risk.
+        atr_buf_mult defaults to 0.25 ATR for tighter triggers on inside bars.
+        """
+        buf = max(atr_now * atr_buf_mult, ref_price * self.pct_buf)
+        entry  = float(hi) + buf
+        stop   = float(lo) - buf
+        risk   = max(entry - stop, 1e-9)
+        target = entry + r_mult * risk
+        return entry, stop, float(target)
+
+    def _status_for_signal(self, cancel_now: bool, signal_is_today: bool) -> str:
+        if cancel_now:
+            return "CANCELED NOW"
+        return "PENDING" if signal_is_today else "VALID"
+
+
 
     # --------------- Utilities ---------------
 
@@ -157,6 +227,21 @@ class PatternDirector:
                 idxs.append(i)
         return idxs
 
+    @staticmethod
+    def _val(x):
+        """
+        Return a clean Python float from pandas/NumPy singletons.
+        Works for: numpy scalars, 0-D arrays, 1-D length-1 arrays, pandas Series length-1, or plain floats.
+        """
+        if isinstance(x, pd.Series):
+            return float(x.iloc[0])
+        arr = np.asarray(x)
+        if arr.ndim == 0:
+            return float(arr.item())
+        if arr.size == 1:
+            return float(arr.reshape(()).item())
+        return float(x)
+
     # --------------- Candlestick detectors ---------------
 
     def _is_doji(self, o, h, l, c, rb_ratio: float = 0.1) -> bool:
@@ -177,59 +262,126 @@ class PatternDirector:
                 self._upper_shadow(o, h, c) <= 0.1 * rng and
                 rb <= 0.3 * rng)
 
-    @staticmethod
-    def _is_bullish_engulfing(prev: pd.Series, cur: pd.Series) -> bool:
-        p_o = float(prev["open"]);  p_c = float(prev["close"])
-        c_o = float(cur["open"]);   c_c = float(cur["close"])
-        # prev down, current up, and current body engulfs prev body
+    # NOTE: make these instance methods so we can use self._val(...)
+    def _is_bullish_engulfing(self, prev: pd.Series, cur: pd.Series) -> bool:
+        p_o = self._val(prev["open"]);  p_c = self._val(prev["close"])
+        c_o = self._val(cur["open"]);   c_c = self._val(cur["close"])
         return (p_c < p_o) and (c_c > c_o) and (c_o <= p_c) and (c_c >= p_o)
 
-    @staticmethod
-    def _is_bearish_engulfing(prev: pd.Series, cur: pd.Series) -> bool:
-        p_o = float(prev["open"]);  p_c = float(prev["close"])
-        c_o = float(cur["open"]);   c_c = float(cur["close"])
-        # prev up, current down, and current body engulfs prev body
+    def _is_bearish_engulfing(self, prev: pd.Series, cur: pd.Series) -> bool:
+        p_o = self._val(prev["open"]);  p_c = self._val(prev["close"])
+        c_o = self._val(cur["open"]);   c_c = self._val(cur["close"])
         return (p_c > p_o) and (c_c < c_o) and (c_o >= p_c) and (c_c <= p_o)
 
-    def _latest_candle_plan(self, df: pd.DataFrame) -> List[Plan]:
-        """Candlestick signals on yesterday & today with present cancel rules."""
-        plans: List[PatternDirector.Plan] = []
-        if len(df) < 3:
+    def _latest_candle_plan(self, df: pd.DataFrame) -> List["PatternDirector.Plan"]:
+        plans: List["PatternDirector.Plan"] = []
+        if len(df) < 6:
             return plans
 
-        last_close = float(df["close"].iloc[-1])
+        last_close = self._val(df["close"].iloc[-1])
 
-        for i in [-2, -1]:  # yesterday and today
-            row, prev = df.iloc[i], df.iloc[i - 1]
-            o, h, l, c = float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
+        def add(name: str, side: str, hi: float, lo: float, date, note=""):
+            if not self._allow(side):            # ⬅️ skip short signals
+                return
+            if side == "bear":
+                cancel_now = last_close > hi
+            elif side == "bull":
+                cancel_now = last_close < lo
+            else:
+                cancel_now = False
+            status = "CANCELED NOW" if cancel_now else "VALID"
+            stop = lo if side == "bull" else (hi if side == "bear" else None)
+            plans.append(self.Plan(
+                pattern=name, side=side, state="CANDLE", date=date,
+                entry=None, stop=float(stop) if stop is not None else None, target=None,
+                cancel_now=cancel_now, status=status, notes=note
+            ))
+
+        # use the last 5 bars: p4,p3,p2,p1,cur
+        p4, p3, p2, p1, cur = [df.iloc[-5+i] for i in range(5)]
+        prev = p1
+
+        # keep your original single-candle checks on yesterday & today
+        for i in [-2, -1]:
+            row, prv = df.iloc[i], df.iloc[i-1]
+            o,h,l,c = map(self._val, (row["open"], row["high"], row["low"], row["close"]))
+            ph,pl = self._val(prv["high"]), self._val(prv["low"])
             date = df.index[i]
+            if self._is_shooting_star(o,h,l,c): add("Shooting Star","bear", h,l,date,"single")
+            if self._is_hammer(o,h,l,c):        add("Hammer","bull", h,l,date,"single")
+            if self._is_doji(o,h,l,c):          add("Doji","neutral",h,l,date,"single")
+            if self._is_bullish_engulfing(prv, row): add("Bullish Engulfing","bull", h,l,date,"2-bar")
+            if self._is_bearish_engulfing(prv, row): add("Bearish Engulfing","bear", h,l,date,"2-bar")
 
-            def add(name: str, side: str, hi: float, lo: float):
-                if side == "bear":
-                    cancel_now = last_close > hi
-                elif side == "bull":
-                    cancel_now = last_close < lo
-                else:
-                    cancel_now = False
-                status = "CANCELED NOW" if cancel_now else ("PENDING" if i == -1 else "VALID")
-                stop = lo if side == "bull" else (hi if side == "bear" else None)
+        if self._is_inside_bar(prev, cur):
+            if self._is_bull(cur["open"], cur["close"]):
+                in_hi = self._val(cur["high"])
+                in_lo = self._val(cur["low"])
+                atr_now = self._val(df["atr14"].iloc[-1])
+                ref_price = self._val(cur["close"])
+                e, s, t = self._levels_for_inside_bullish(in_hi, in_lo, atr_now, ref_price)
+
+                cancel_now = last_close < in_lo
+                status = self._status_for_signal(cancel_now, signal_is_today=True)
+
                 plans.append(self.Plan(
-                    pattern=name, side=side, state="CANDLE", date=date,
-                    entry=None, stop=stop, target=None,
-                    cancel_now=cancel_now, status=status,
-                    notes=f"signal_candle={'today' if i==-1 else 'yesterday'}"
+                    pattern="Bullish Inside (Harami)",
+                    side="bull",
+                    state="CANDLE",
+                    date=df.index[-1],
+                    entry=e, stop=s, target=t,
+                    cancel_now=cancel_now, status=status, notes="2-bar"
                 ))
+            elif self._is_bear(cur["open"], cur["close"]):
+                # skip if long-only, or implement symmetric short logic
+                if self._allow("bear"):
+                    add("Bearish Inside (Harami)","bear",
+                        self._val(prev["high"]), self._val(prev["low"]),
+                        df.index[-1], "2-bar")
 
-            if self._is_shooting_star(o, h, l, c):
-                add("Shooting Star", "bear", h, l)
-            if self._is_hammer(o, h, l, c):
-                add("Hammer", "bull", h, l)
-            if self._is_doji(o, h, l, c):
-                add("Doji", "neutral", h, l)
-            if self._is_bullish_engulfing(prev, row):
-                add("Bullish Engulfing", "bull", h, l)
-            if self._is_bearish_engulfing(prev, row):
-                add("Bearish Engulfing", "bear", h, l)
+
+        if self._is_bullish_harami(prev, cur):
+            add("Bullish Harami","bull", self._val(prev["high"]), self._val(prev["low"]), df.index[-1], "2-bar")
+        if self._is_bearish_harami(prev, cur):
+            add("Bearish Harami","bear", self._val(prev["high"]), self._val(prev["low"]), df.index[-1], "2-bar")
+
+        if self._is_bullish_outside(prev, cur):
+            add("Bullish Outside (Engulfing Range)","bull", self._val(cur["high"]), self._val(cur["low"]), df.index[-1], "2-bar")
+        if self._is_bearish_outside(prev, cur):
+            add("Bearish Outside (Engulfing Range)","bear", self._val(cur["high"]), self._val(cur["low"]), df.index[-1], "2-bar")
+
+        if self._is_bullish_kicker(prev, cur):
+            add("Bullish Kicker","bull", self._val(cur["high"]), self._val(prev["low"]), df.index[-1], "gap-reversal")
+        if self._is_bearish_kicker(prev, cur):
+            add("Bearish Kicker","bear", self._val(prev["high"]), self._val(cur["low"]), df.index[-1], "gap-reversal")
+
+        # --- NEW 3-bar patterns (p2, p1, cur) ---
+        if self._is_morning_star(p2, p1, cur):
+            hi = max(self._val(p2["high"]), self._val(cur["high"]))
+            lo = min(self._val(p2["low"]),  self._val(p1["low"]))
+            add("Morning Star","bull", hi, lo, df.index[-1], "3-bar")
+
+        if self._is_evening_star(p2, p1, cur):
+            hi = max(self._val(p2["high"]), self._val(p1["high"]))
+            lo = min(self._val(p2["low"]),  self._val(cur["low"]))
+            add("Evening Star","bear", hi, lo, df.index[-1], "3-bar")
+
+        if self._is_three_inside_up(p1, cur, df.iloc[-1] if len(df) >= 3 else cur):
+            add("Three Inside Up","bull", self._val(p1["high"]), self._val(p1["low"]), df.index[-1], "3-bar")
+
+        if self._is_three_inside_down(p1, cur, df.iloc[-1] if len(df) >= 3 else cur):
+            add("Three Inside Down","bear", self._val(p1["high"]), self._val(p1["low"]), df.index[-1], "3-bar")
+
+        # --- NEW 5-bar continuation (p4,p3,p2,p1,cur) ---
+        if self._is_rising_three_methods(p4, p3, p2, p1, cur):
+            hi = max(self._val(p4["high"]), self._val(cur["high"]))
+            lo = self._val(min(p3["low"], p2["low"], p1["low"], p4["low"]))
+            add("Rising Three Methods","bull", hi, lo, df.index[-1], "5-bar")
+
+        if self._is_falling_three_methods(p4, p3, p2, p1, cur):
+            hi = self._val(max(p3["high"], p2["high"], p1["high"], p4["high"]))
+            lo = min(self._val(p4["low"]), self._val(cur["low"]))
+            add("Falling Three Methods","bear", hi, lo, df.index[-1], "5-bar")
 
         return plans
 
@@ -244,11 +396,11 @@ class PatternDirector:
         highs = section["high"].to_numpy()
         lows = section["low"].to_numpy()
         closes = section["close"].to_numpy()
-        last_close = closes[-1]
-        atr14 = float(section["atr14"].iloc[-1])
+        last_close = self._val(closes[-1])
+        atr14 = self._val(section["atr14"].iloc[-1])
 
-        rim_price = float(highs.max())
-        bottom_price = float(lows.min())
+        rim_price = self._val(highs.max())
+        bottom_price = self._val(lows.min())
         depth = (rim_price - bottom_price) / max(rim_price, 1e-9)
         if depth < min_depth:
             return None
@@ -265,8 +417,8 @@ class PatternDirector:
         handle_lows = lows[-handle_window:]
         handle_highs = highs[-handle_window:]
 
-        handle_low = float(handle_lows.min())
-        handle_high = float(handle_highs.max())
+        handle_low = self._val(handle_lows.min())
+        handle_high = self._val(handle_highs.max())
         handle_depth = (rim_price - handle_low) / max(rim_price, 1e-9)
         if handle_depth > max_handle_depth or handle_low <= bottom_price:
             return None
@@ -275,9 +427,7 @@ class PatternDirector:
         stop = handle_low
         target = entry + (rim_price - bottom_price)
 
-        # Present cancel/valid state
         if last_close > entry:
-            # Breakout already; fail if immediate slump below entry (small buffer)
             buff = max(atr14, entry * 0.0025)
             cancel_now = last_close < (entry - 0.25 * buff)
             status, state = ("CANCELED NOW" if cancel_now else "VALID", "BREAKOUT")
@@ -297,19 +447,19 @@ class PatternDirector:
         lows = section["low"].to_numpy()
         highs = section["high"].to_numpy()
         closes = section["close"].to_numpy()
-        atr14 = float(section["atr14"].iloc[-1])
-        last_close = float(closes[-1])
+        atr14 = self._val(section["atr14"].iloc[-1])
+        last_close = self._val(closes[-1])
 
         troughs = self._find_troughs(lows, window=3)
         if len(troughs) < 2:
             return None
         i1, i2 = troughs[-2], troughs[-1]
-        low1, low2 = float(lows[i1]), float(lows[i2])
+        low1, low2 = self._val(lows[i1]), self._val(lows[i2])
 
         if abs(low2 - low1) / max((low1 + low2) / 2, 1e-9) > max_gap_pct:
             return None
 
-        neckline = float(highs[i1:i2+1].max())
+        neckline = self._val(highs[i1:i2+1].max())
         entry = neckline
         stop = min(low1, low2)
         target = entry + (entry - stop)
@@ -334,8 +484,8 @@ class PatternDirector:
         highs = section["high"].to_numpy()
         lows = section["low"].to_numpy()
         closes = section["close"].to_numpy()
-        atr14 = float(section["atr14"].iloc[-1])
-        last_close = float(closes[-1])
+        atr14 = self._val(section["atr14"].iloc[-1])
+        last_close = self._val(closes[-1])
 
         peaks = self._find_peaks(highs, window=3)
         troughs = self._find_troughs(lows, window=3)
@@ -343,7 +493,7 @@ class PatternDirector:
             return None
 
         p1, p2, p3 = peaks[-3], peaks[-2], peaks[-1]
-        LS, HEAD, RS = float(highs[p1]), float(highs[p2]), float(highs[p3])
+        LS, HEAD, RS = self._val(highs[p1]), self._val(highs[p2]), self._val(highs[p3])
         if not (HEAD > LS and HEAD > RS):
             return None
         if abs(LS - RS) / max((LS + RS) / 2, 1e-9) > shoulder_tol:
@@ -353,7 +503,7 @@ class PatternDirector:
         if len(lows_between) < 2:
             return None
         t1, t2 = lows_between[0], lows_between[-1]
-        neck1, neck2 = float(lows[t1]), float(lows[t2])
+        neck1, neck2 = self._val(lows[t1]), self._val(lows[t2])
         neckline = (neck1 + neck2) / 2.0  # simple avg neckline
 
         entry = neckline
@@ -374,9 +524,13 @@ class PatternDirector:
 
     # --------------- Planner ---------------
 
-    def _choose_best_plan(self, chart_plans: List[Plan], candle_plans: List[Plan]) -> Optional[Plan]:
-        """Priority: Chart BREAKOUT > Chart PRE > Candle VALID > Candle PENDING. Drop CANCELED NOW."""
-        def pri(p: PatternDirector.Plan) -> Tuple[int, int]:
+    def _choose_best_plan(self, chart_plans: List["PatternDirector.Plan"],
+                        candle_plans: List["PatternDirector.Plan"]) -> Optional["PatternDirector.Plan"]:
+        """
+        Choose among *pre-filtered actionable* plans.
+        Priority: Chart BREAKOUT > Chart PRE_BREAKOUT > Candle VALID > Candle PENDING.
+        """
+        def pri(p: "PatternDirector.Plan") -> Tuple[int, int]:
             state_rank = {"BREAKOUT": 3, "PRE_BREAKOUT": 2, "CANDLE": 1}[p.state]
             ok_rank = {"VALID": 2, "PENDING": 1, "CANCELED NOW": 0}[p.status]
             return (state_rank, ok_rank)
@@ -388,8 +542,8 @@ class PatternDirector:
         return pool[0]
 
     def _print_best(self, df: pd.DataFrame, best: Plan):
-        last_atr = float(df["atr14"].iloc[-1])
-        price = float(df["close"].iloc[-1])
+        last_atr = self._val(df["atr14"].iloc[-1])
+        price = self._val(df["close"].iloc[-1])
         buff = max(last_atr * self.atr_mult, price * self.pct_buf)
 
         e = f"{best.entry:.2f}" if best.entry else "-"
@@ -413,6 +567,195 @@ class PatternDirector:
                     print("  Watch: Confirm down next bar; CANCEL NOW if present close > signal high.")
                 else:
                     print("  Note : Doji is neutral; wait for direction.")
+
+    def _is_actionable_now(self, plan: "PatternDirector.Plan", df: pd.DataFrame) -> Tuple[bool, str]:
+        """
+        Keep:
+        - PRE_BREAKOUT not canceled (watch for trigger)
+        - BREAKOUT that is 'fresh' (close near entry) and still decent R/R from *now*
+        - Candles not canceled
+        - NEW: Bullish signals must pass RSI/MACD momentum filter
+        """
+        if self.long_only and plan.side == "bear":
+            return (False, "short_hidden")
+
+        # thresholds (configurable)
+        fresh_breakout_max_atr = getattr(self, "fresh_breakout_max_atr", 0.75)
+        fresh_breakout_max_pct = getattr(self, "fresh_breakout_max_pct", 0.01)
+        max_beyond_target_pct  = getattr(self, "max_beyond_target_pct", 0.0025)
+
+        # momentum thresholds (override via cfg["momentum_filter"] if you want)
+        rsi_min  = getattr(self, "rsi_min", 50)   # require RSI >= 50 for longs
+        rsi_hot  = getattr(self, "rsi_hot", 80)   # avoid fresh entries if RSI > 80
+        hist_win = getattr(self, "macd_hist_rising_window", 3)  # rising window
+
+        price = self._val(df["close"].iloc[-1])
+        atr   = self._val(df["atr14"].iloc[-1])
+
+        # --- helper: momentum pass for bullish-only plans ---
+        def bullish_momentum_ok() -> Tuple[bool, str]:
+            if "rsi14" not in df.columns or "macd_hist" not in df.columns:
+                return (True, "mom_skip_no_cols")  # fail-open if not computed
+
+            rsi  = float(df["rsi14"].iloc[-1])
+            hist = float(df["macd_hist"].iloc[-1])
+            if len(df) > hist_win:
+                hist_prev = float(df["macd_hist"].iloc[-1 - hist_win])
+                hist_rising = (hist - hist_prev) > 0
+            else:
+                hist_rising = hist > 0
+
+            if rsi < rsi_min:
+                return (False, f"rsi<min({rsi:.0f}<{rsi_min})")
+            if rsi > rsi_hot:
+                return (False, f"rsi_hot({rsi:.0f}>{rsi_hot})")
+            if not (hist > 0 or hist_rising):
+                return (False, "macd_hist_not_pos_or_rising")
+            return (True, "mom_ok")
+
+        # Cancelled is out
+        if plan.status == "CANCELED NOW":
+            return (False, "canceled")
+
+        # Apply momentum gating to bullish setups (skip neutral/doji)
+        if plan.side == "bull":
+            ok_mom, why_mom = bullish_momentum_ok()
+            if not ok_mom:
+                return (False, why_mom)
+
+        # Candle logic (after momentum)
+        if plan.state == "CANDLE":
+            if plan.entry and plan.stop and plan.target:
+                risk   = max(plan.entry - plan.stop, 1e-9) if plan.side == "bull" else max(plan.stop - plan.entry, 1e-9)
+                reward = (plan.target - plan.entry) if plan.side == "bull" else (plan.entry - plan.target)
+                rr = reward / risk
+                if rr < self.min_rr_ok:
+                    return (False, f"rr_plan_too_low({rr:.2f}R)")
+            return (plan.status in {"VALID", "PENDING"}, "candle")
+
+        # Pre-breakout chart pattern
+        if plan.state == "PRE_BREAKOUT":
+            return (True, "pre_breakout")
+
+        # Fresh breakout checks
+        if plan.state == "BREAKOUT":
+            if not plan.entry:
+                return (False, "no_entry")
+
+            if plan.target:
+                near_target = price >= plan.target * (1 - max_beyond_target_pct)
+                if near_target:
+                    return (False, "target_already_hit")
+
+            dist = max(price - plan.entry, 0.0)
+            fresh_by_atr = dist <= fresh_breakout_max_atr * atr
+            fresh_by_pct = dist <= fresh_breakout_max_pct * (plan.entry or price)
+            if not (fresh_by_atr or fresh_by_pct):
+                return (False, "late_breakout")
+
+            if plan.target and plan.stop:
+                risk_now = max(price - plan.stop, 1e-9)
+                reward_now = plan.target - price
+                rr_now = reward_now / risk_now
+                if rr_now < self.min_rr_ok:
+                    return (False, f"rr_now_too_low({rr_now:.2f}R)")
+
+            return (True, "fresh_breakout")
+
+        return (False, "unknown_state")
+
+# --------------- Cendels helper ---------------
+
+    def _f(self, x) -> float:
+        return self._val(x)
+    def _is_bull(self, o, c): return self._f(c) > self._f(o)
+    def _is_bear(self, o, c): return self._f(c) < self._f(o)
+    def _body_hi(self, o, c): return max(self._f(o), self._f(c))
+    def _body_lo(self, o, c): return min(self._f(o), self._f(c))
+    def _gap_above(self, prev_h, cur_l): return self._f(cur_l) > self._f(prev_h)
+    def _gap_below(self, prev_l, cur_h): return self._f(cur_h) < self._f(prev_l)
+    def _range(self, h, l): return max(self._f(h) - self._f(l), 1e-9)
+    def _body(self, o, c): return abs(self._f(c) - self._f(o))
+    def _allow(self, side: str) -> bool:
+        return not (self.long_only and side == "bear")
+
+    def _is_inside_bar(self, prev, cur) -> bool:
+        ph, pl = self._f(prev["high"]), self._f(prev["low"])
+        ch, cl = self._f(cur["high"]),  self._f(cur["low"])
+        return (ch <= ph) and (cl >= pl)
+
+    def _is_bullish_harami(self, prev, cur) -> bool:
+        return (self._is_bear(prev["open"], prev["close"]) and
+                self._is_bull(cur["open"],  cur["close"])  and
+                self._body_hi(cur["open"], cur["close"]) <= self._body_hi(prev["open"], prev["close"]) and
+                self._body_lo(cur["open"], cur["close"]) >= self._body_lo(prev["open"], prev["close"]))
+
+    def _is_bearish_harami(self, prev, cur) -> bool:
+        return (self._is_bull(prev["open"], prev["close"]) and
+                self._is_bear(cur["open"],  cur["close"])  and
+                self._body_hi(cur["open"], cur["close"]) <= self._body_hi(prev["open"], prev["close"]) and
+                self._body_lo(cur["open"], cur["close"]) >= self._body_lo(prev["open"], prev["close"]))
+
+    def _is_bullish_outside(self, prev, cur) -> bool:
+        ph, pl = self._f(prev["high"]), self._f(prev["low"])
+        ch, cl = self._f(cur["high"]),  self._f(cur["low"])
+        return (ch >= ph) and (cl <= pl) and self._is_bull(cur["open"], cur["close"])
+
+    def _is_bearish_outside(self, prev, cur) -> bool:
+        ph, pl = self._f(prev["high"]), self._f(prev["low"])
+        ch, cl = self._f(cur["high"]),  self._f(cur["low"])
+        return (ch >= ph) and (cl <= pl) and self._is_bear(cur["open"], cur["close"])
+
+    def _is_bullish_kicker(self, prev, cur) -> bool:
+        return (self._is_bear(prev["open"], prev["close"]) and
+                self._gap_above(prev["high"], cur["low"]) and
+                self._is_bull(cur["open"],  cur["close"]))
+
+    def _is_bearish_kicker(self, prev, cur) -> bool:
+        return (self._is_bull(prev["open"], prev["close"]) and
+                self._gap_below(prev["low"], cur["high"]) and
+                self._is_bear(cur["open"],  cur["close"]))
+
+    def _is_morning_star(self, p2, p1, cur) -> bool:
+        # bear -> small body -> bull closing into p2 body midpoint
+        mid_p2 = (self._f(p2["open"]) + self._f(p2["close"])) / 2.0
+        return (self._is_bear(p2["open"], p2["close"]) and
+                self._body(p1["open"], p1["close"]) <= 0.5 * self._body(p2["open"], p2["close"]) and
+                self._is_bull(cur["open"], cur["close"]) and
+                self._f(cur["close"]) >= mid_p2)
+
+    def _is_evening_star(self, p2, p1, cur) -> bool:
+        mid_p2 = (self._f(p2["open"]) + self._f(p2["close"])) / 2.0
+        return (self._is_bull(p2["open"], p2["close"]) and
+                self._body(p1["open"], p1["close"]) <= 0.5 * self._body(p2["open"], p2["close"]) and
+                self._is_bear(cur["open"], cur["close"]) and
+                self._f(cur["close"]) <= mid_p2)
+
+    def _is_three_inside_up(self, prev, cur, nxt) -> bool:
+        return self._is_bullish_harami(prev, cur) and (self._f(nxt["close"]) > self._f(prev["open"]))
+
+    def _is_three_inside_down(self, prev, cur, nxt) -> bool:
+        return self._is_bearish_harami(prev, cur) and (self._f(nxt["close"]) < self._f(prev["open"]))
+
+    def _is_rising_three_methods(self, p4, p3, p2, p1, cur) -> bool:
+        big_bull = self._is_bull(p4["open"], p4["close"]) and \
+                self._body(p4["open"], p4["close"]) >= 0.5 * self._range(p4["high"], p4["low"])
+        inside_all = all([(self._f(b["high"]) <= self._f(p4["high"]) and self._f(b["low"]) >= self._f(p4["low"]))
+                        for b in (p3, p2, p1)])
+        small_counter = all([self._body(b["open"], b["close"]) <= 0.6 * self._body(p4["open"], p4["close"])
+                            for b in (p3, p2, p1)])
+        return big_bull and inside_all and small_counter and \
+            self._is_bull(cur["open"], cur["close"]) and (self._f(cur["close"]) > self._f(p4["high"]))
+
+    def _is_falling_three_methods(self, p4, p3, p2, p1, cur) -> bool:
+        big_bear = self._is_bear(p4["open"], p4["close"]) and \
+                self._body(p4["open"], p4["close"]) >= 0.5 * self._range(p4["high"], p4["low"])
+        inside_all = all([(self._f(b["high"]) <= self._f(p4["high"]) and self._f(b["low"]) >= self._f(p4["low"]))
+                        for b in (p3, p2, p1)])
+        small_counter = all([self._body(b["open"], b["close"]) <= 0.6 * self._body(p4["open"], p4["close"])
+                            for b in (p3, p2, p1)])
+        return big_bear and inside_all and small_counter and \
+            self._is_bear(cur["open"], cur["close"]) and (self._f(cur["close"]) < self._f(p4["low"]))
 
 
 
