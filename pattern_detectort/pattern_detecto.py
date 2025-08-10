@@ -462,6 +462,26 @@ class PatternDirector:
         c_o = self._val(cur["open"]);   c_c = self._val(cur["close"])
         return (p_c > p_o) and (c_c < c_o) and (c_o >= p_c) and (c_c <= p_o)
 
+    def _bullish_engulfing_breakout_plan(self, prev: pd.Series, row: pd.Series, date, df: pd.DataFrame, last_close: float) -> "PatternDirector.Plan":
+            """
+            Entry: buy-stop above engulfing high + buffer
+            Stop:  below engulfing low  - buffer
+            Target: 2R by default (reuse inside-bar logic)
+            """
+            hi  = self._val(row["high"])
+            lo  = self._val(row["low"])
+            atr = self._val(df["atr14"].loc[date])
+            ref = self._val(row["close"])
+
+            # reuse your existing helper
+            e, s, t = self._levels_for_inside_bullish(hi, lo, atr, ref, r_mult=2.0, atr_buf_mult=0.25)
+
+            cancel_now = last_close < lo
+            status = self._status_for_signal(cancel_now, signal_is_today=(date == df.index[-1]))
+            return self.Plan("Bullish Engulfing", "bull", "CANDLE", date, e, s, t, cancel_now, status, "2-bar")
+
+
+
     def _doji_breakout_plan(self, row, date, df, last_close):
         hi  = self._val(row["high"])
         lo  = self._val(row["low"])
@@ -515,8 +535,12 @@ class PatternDirector:
             if self._is_hammer(o,h,l,c):        add("Hammer","bull", h,l,date,"single")
             if self._is_doji(o,h,l,c):          
                 plans.append(self._doji_breakout_plan(row, date, df, last_close))
-            if self._is_bullish_engulfing(prv, row): add("Bullish Engulfing","bull", h,l,date,"2-bar")
-            if self._is_bearish_engulfing(prv, row): add("Bearish Engulfing","bear", h,l,date,"2-bar")
+            # if self._is_bullish_engulfing(prv, row): add("Bullish Engulfing","bull", h,l,date,"2-bar")
+            if self._is_bullish_engulfing(prv, row):
+                plans.append(self._bullish_engulfing_breakout_plan(prv, row, date, df, last_close))
+
+            if self._is_bearish_engulfing(prv, row):
+                add("Bearish Engulfing","bear", h,l,date,"2-bar")
 
         if self._is_inside_bar(prev, cur):
             if self._is_bull(cur["open"], cur["close"]):
@@ -1017,6 +1041,7 @@ class PatternDirector:
                 return f"Set sell-stop {p.entry:.2f}; stop {p.stop:.2f}; target {p.target:.2f}. Cancel if close > {p.stop:.2f}."
             else:
                 return f"Triggered below {p.entry:.2f}. Manage toward {p.target:.2f}; exit if close > {p.stop:.2f}."
+
 
 
 if __name__ == "__main__":
