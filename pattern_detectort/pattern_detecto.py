@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import warnings
+import re
 
 # Quiet the noisy library warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -181,11 +182,21 @@ class PatternDirector:
         except Exception:
             return None
 
+    def _read_tickers_file(self, path: str):
+        p = Path(path)
+        if not p.exists(): return []
+        out = []
+        for line in p.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"): continue
+            # allow comma/space separated on one line
+            out.extend([s for s in re.split(r"[,\s]+", line.upper()) if s])
+        return out
 
 
     def _normalize_config(self, raw: Dict) -> Dict:
-        if "tickers" not in raw or not isinstance(raw["tickers"], list) or not raw["tickers"]:
-            raise ValueError("Config must contain non-empty 'tickers' list.")
+        raw.setdefault("tickers", [])
+        raw.setdefault("tickers_files", [])
         raw.setdefault("period", "1y")
         raw.setdefault("interval", "1d")
         raw.setdefault("risk", {"atr_mult": 1.0, "percent_buffer": 0.0025})
@@ -194,7 +205,16 @@ class PatternDirector:
         raw.setdefault("min_rr_ok", 1.2)
         raw.setdefault("require_above_sma150_for_longs", False)
         raw.setdefault("require_below_sma150_for_shorts", False)
-        raw.setdefault("sma150_recent_cross_days", 0)  # 0 = ignore recency
+        raw.setdefault("sma150_recent_cross_days", 0)
+
+        tickers = [t.upper() for t in raw.get("tickers", [])]
+        for f in raw.get("tickers_files", []):
+            tickers += self._read_tickers_file(f)
+
+        # dedupe + stable sort
+        raw["tickers"] = sorted(set(tickers))
+        if not raw["tickers"]:
+            raise ValueError("Config must contain non-empty 'tickers' (direct or from tickers_files).")
         return raw
 
     def _get_history(self, ticker: str, period: str, interval: str) -> pd.DataFrame:
