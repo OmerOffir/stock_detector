@@ -40,6 +40,7 @@ class BotPatternDetector:
         for ticker, data in results.items():
             best   = data.get("best")
             report = data.get("report")
+            price = data.get("current_price")
             if not best or not report:
                 continue
 
@@ -52,6 +53,9 @@ class BotPatternDetector:
                 f"{'⏳ PENDING' if best['status']=='PENDING' else best['status']}\n"
                 f"*{best['date']} • {self.pattern_driver.period}, {self.pattern_driver.interval}*"
             )
+            current_price = (
+                f"$ {price}"
+            )
 
             levels = (
                 f"🔓 **Entry** {self._fmt(best.get('entry'))}  •  "
@@ -63,6 +67,7 @@ class BotPatternDetector:
                 "title": f"🚀 Stock Pattern Detect Alert — {ticker}",
                 "description": (
                     f"{header}\n\n"
+                    f"**Stock Price**\n{current_price}\n\n"
                     f"**Levels**\n{levels}\n\n"
                     f"**Risk/Reward**\n{rr_txt}\n\n"
                     f"**Next Step**\n{self._next_step(best)}\n\n"

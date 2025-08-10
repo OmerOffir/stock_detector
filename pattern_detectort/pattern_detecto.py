@@ -111,12 +111,14 @@ class PatternDirector:
                 (actionable_candles if ok else []).append(c) if ok else setattr(c, "notes", (c.notes + f" | filtered:{why}").strip())
 
             best = self._choose_best_plan(actionable_charts, actionable_candles)
+            current_price = self.get_current_price(t)
 
             payload = {
                 "ticker": t,
                 "period": self.period,
                 "interval": self.interval,
                 "best": self._plan_to_dict(best) if best else None,
+                "current_price": current_price,
                 "actionable": {
                     "charts":  [self._plan_to_dict(p) for p in actionable_charts],
                     "candles": [self._plan_to_dict(p) for p in actionable_candles],
@@ -139,6 +141,47 @@ class PatternDirector:
         with open(json_path, "r", encoding="utf-8") as f:
             raw = json.load(f)
         return self._normalize_config(raw)
+
+    def get_current_price(self, ticker: str, prefer_intraday: bool = True) -> Optional[float]:
+        """
+        Return the most recent traded price for `ticker` using yfinance.
+        - Tries intraday (1m) first if available.
+        - Falls back to last daily close.
+        - As a last resort, uses fast_info/info.
+        Returns None if nothing could be fetched.
+        """
+        try:
+            # 1) Intraday (best when market is open)
+            if prefer_intraday:
+                df = yf.download(ticker, period="5d", interval="1m",
+                                progress=False, auto_adjust=False)
+                if not df.empty and "Close" in df.columns:
+                    last = df["Close"].dropna().iloc[-1]
+                    return float(last)
+
+            # 2) Last daily close
+            df = yf.download(ticker, period="1mo", interval="1d",
+                            progress=False, auto_adjust=False)
+            if not df.empty and "Close" in df.columns:
+                last = df["Close"].dropna().iloc[-1]
+                return float(last)
+
+            # 3) Fallbacks: fast_info / info
+            tkr = yf.Ticker(ticker)
+            fi = getattr(tkr, "fast_info", None)
+            if fi and hasattr(fi, "get"):
+                val = fi.get("last_price") or fi.get("regular_market_price") or fi.get("previous_close")
+                if val is not None:
+                    return float(val)
+
+            info = getattr(tkr, "info", {}) or {}
+            val = info.get("regularMarketPrice") or info.get("previousClose")
+            return float(val) if val is not None else None
+
+        except Exception:
+            return None
+
+
 
     def _normalize_config(self, raw: Dict) -> Dict:
         if "tickers" not in raw or not isinstance(raw["tickers"], list) or not raw["tickers"]:
