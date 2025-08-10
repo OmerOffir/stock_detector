@@ -1,5 +1,5 @@
 {
-  "tickers": ["AAPL", "MSFT", "NVDA", "AMZN", "COST", "IONQ"],
+  "tickers": ["AAPL", "MSFT", "NVDA", "AMZN", "COST", "IONQ","OKLO","V", "MAGS","QQQ","DOW","VIG","SPY","GM","GOOGL","PANW","WMT","APP","SPOT","PLTR","RDDT","META","TTWO"],
   "period": "1y",
   "interval": "1d",
   "risk": { "atr_mult": 1.0, "percent_buffer": 0.0025 },

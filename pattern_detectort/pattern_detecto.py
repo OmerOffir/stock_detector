@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
+from pprint import pprint
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -54,77 +55,82 @@ class PatternDirector:
         else:
             cfg = self._normalize_config(config)
 
+        self.show_bearish_info = bool(cfg.get("show_bearish_info", True))
         self.tickers: List[str] = cfg["tickers"]
         self.period: str = cfg["period"]
         self.interval: str = cfg["interval"]
         self.atr_mult: float = float(cfg["risk"].get("atr_mult", 1.0))
         self.pct_buf: float = float(cfg["risk"].get("percent_buffer", 0.0025))
-        self.long_only: bool = bool(cfg.get("long_only", True))
+        self.long_only: bool = bool(cfg.get("long_only", False))
         self.relevance = {
             "fresh_breakout_max_atr": 0.75,   # how far above entry a breakout can be and still be 'fresh'
             "fresh_breakout_max_pct": 0.01,   # or within 1% of entry
             "max_beyond_target_pct": 0.0025  # if price basically tagged target, hide
         }
+        self.fresh_breakout_max_atr = self.relevance["fresh_breakout_max_atr"]
+        self.fresh_breakout_max_pct = self.relevance["fresh_breakout_max_pct"]
+        self.max_beyond_target_pct  = self.relevance["max_beyond_target_pct"]
         mom = cfg.get("momentum_filter", {})
         self.min_rr_ok =  float(cfg["min_rr_ok"])
         self.rsi_min  = float(mom.get("rsi_min", 50))
         self.rsi_hot  = float(mom.get("rsi_hot", 80))
         self.macd_hist_rising_window = int(mom.get("macd_hist_rising_window", 3))
+        self.require_above_sma150_for_longs = bool(cfg.get("require_above_sma150_for_longs", False))
+        self.require_below_sma150_for_shorts = bool(cfg.get("require_below_sma150_for_shorts", False))
+        self.sma150_recent_cross_days = int(cfg.get("sma150_recent_cross_days", 0))
 
     # --------------- Public API ---------------
 
-    def run(self):
+    def run(self, include_report: bool = True) -> Dict[str, Dict]:
+        results: Dict[str, Dict] = {}
         for t in self.tickers:
-            try:
-                df = self._get_history(t, self.period, self.interval)
-            except Exception as e:
-                print(f"[{t}] ERROR: {e}")
-                continue
+            df = self._get_history(t, self.period, self.interval)
 
-            # --- raw detections ---
             chart_plans: List[PatternDirector.Plan] = []
-            for detector in (self._detect_cup_and_handle,
-                            self._detect_double_bottom,
-                            self._detect_head_and_shoulders):
-                try:
-                    plan = detector(df)
-                    if plan and self._allow(plan.side):   # ⬅️ only keep longs/neutral
-                        chart_plans.append(plan)
-                except Exception:
-                    pass
+            bear_chart_info: List[PatternDirector.Plan] = []
 
-            candle_plans = self._latest_candle_plan(df)
+            for detector in (self._detect_cup_and_handle, self._detect_double_bottom, self._detect_head_and_shoulders):
+                plan = detector(df)
+                if not plan:
+                    continue
+                if plan.side == "bear" and self.long_only:
+                    if self.show_bearish_info:
+                        bear_chart_info.append(plan)
+                    continue
+                chart_plans.append(plan)
 
-            # --- relevance filter (keep only actionable-now) ---
+            candle_plans, bear_candle_info = self._latest_candle_plan(df)
+
+            # actionable filter (long-only remains actionable)
             actionable_charts, actionable_candles = [], []
             for p in chart_plans:
                 ok, why = self._is_actionable_now(p, df)
-                if ok:
-                    actionable_charts.append(p)
-                else:
-                    p.notes = (p.notes + f" | filtered:{why}").strip()
-
+                (actionable_charts if ok else []).append(p) if ok else setattr(p, "notes", (p.notes + f" | filtered:{why}").strip())
             for c in candle_plans:
                 ok, why = self._is_actionable_now(c, df)
-                if ok:
-                    actionable_candles.append(c)
-                else:
-                    c.notes = (c.notes + f" | filtered:{why}").strip()
+                (actionable_candles if ok else []).append(c) if ok else setattr(c, "notes", (c.notes + f" | filtered:{why}").strip())
 
             best = self._choose_best_plan(actionable_charts, actionable_candles)
 
-            print(f"\n=== {t} — Present Pattern Director ({self.period}, {self.interval}) ===")
-            if best:
-                self._print_best(df, best)
-            else:
-                print("No actionable setup now. (Everything either stale, late, or canceled.)")
+            payload = {
+                "ticker": t,
+                "period": self.period,
+                "interval": self.interval,
+                "best": self._plan_to_dict(best) if best else None,
+                "actionable": {
+                    "charts":  [self._plan_to_dict(p) for p in actionable_charts],
+                    "candles": [self._plan_to_dict(p) for p in actionable_candles],
+                },
+                "bearish_info": {
+                    "charts":  [self._plan_to_dict(p) for p in bear_chart_info],
+                    "candles": [self._plan_to_dict(p) for p in bear_candle_info],
+                },
+            }
+            if best and include_report:
+                payload["report"] = self._format_report(t, df, best, actionable_charts, actionable_candles)
 
-            # Optional: print only actionable context (clean output)
-            for p in actionable_charts:
-                print(f"  • {p.pattern:16} {p.state:12} {p.status:12} "
-                    f"entry={p.entry and round(p.entry,2)} stop={p.stop and round(p.stop,2)}")
-            for c in actionable_candles:
-                print(f"  • Candle {c.pattern:16} {c.state:12} {c.status:12} ({c.notes})")
+            results[t] = payload
+        return results
 
     # --------------- Config / Data ---------------
 
@@ -141,6 +147,11 @@ class PatternDirector:
         raw.setdefault("interval", "1d")
         raw.setdefault("risk", {"atr_mult": 1.0, "percent_buffer": 0.0025})
         raw.setdefault("long_only", True)
+        raw.setdefault("show_bearish_info", True)
+        raw.setdefault("min_rr_ok", 1.2)
+        raw.setdefault("require_above_sma150_for_longs", False)
+        raw.setdefault("require_below_sma150_for_shorts", False)
+        raw.setdefault("sma150_recent_cross_days", 0)  # 0 = ignore recency
         return raw
 
     def _get_history(self, ticker: str, period: str, interval: str) -> pd.DataFrame:
@@ -152,6 +163,7 @@ class PatternDirector:
         df["atr14"] = self._atr(df, 14)
         df["rsi14"] = self._rsi(df["close"], 14)
         df["macd"], df["macd_signal"], df["macd_hist"] = self._macd(df["close"])
+        df["sma150"] = df["close"].rolling(150, min_periods=150).mean()  
         return df
 
     def _atr(self, df: pd.DataFrame, n: int = 14) -> pd.Series:
@@ -195,6 +207,110 @@ class PatternDirector:
             return "CANCELED NOW"
         return "PENDING" if signal_is_today else "VALID"
 
+
+    def _plan_to_dict(self, p: "PatternDirector.Plan") -> Dict:
+        d = {
+            "pattern": p.pattern,
+            "side": p.side,
+            "state": p.state,
+            "date": str(pd.Timestamp(p.date).date()) if p.date is not None else None,
+            "entry": None if p.entry is None else float(p.entry),
+            "stop":  None if p.stop  is None else float(p.stop),
+            "target":None if p.target is None else float(p.target),
+            "cancel_now": bool(p.cancel_now),
+            "status": p.status,
+            "notes": p.notes or "",
+        }
+        # attach RR if we can compute it
+        if d["entry"] is not None and d["stop"] is not None and d["target"] is not None:
+            risk   = max(d["entry"] - d["stop"], 1e-9) if p.side == "bull" else max(d["stop"] - d["entry"], 1e-9)
+            reward = (d["target"] - d["entry"]) if p.side == "bull" else (d["entry"] - d["target"])
+            d["rr"] = float(reward / risk)
+        return d
+
+    def _watch_text(self, best: "PatternDirector.Plan") -> str:
+        if best.status == "PENDING":
+            if best.state == "PRE_BREAKOUT":
+                return "Watch: Breakout above entry; CANCEL NOW if price closes below stop."
+            if best.state == "CANDLE":
+                if best.side == "bull":
+                    return "Watch: Confirm up next bar; CANCEL NOW if present close < signal low."
+                if best.side == "bear":
+                    return "Watch: Confirm down next bar; CANCEL NOW if present close > signal high."
+                return "Note : Doji is neutral; wait for direction."
+        return ""
+
+    def _format_report(self, ticker: str, df: pd.DataFrame, best: "PatternDirector.Plan",
+                    actionable_charts: List["PatternDirector.Plan"],
+                    actionable_candles: List["PatternDirector.Plan"]) -> str:
+        last_atr = self._val(df["atr14"].iloc[-1])
+        price = self._val(df["close"].iloc[-1])
+        buff = max(last_atr * self.atr_mult, price * self.pct_buf)
+
+        def f(x): return "-" if x is None else f"{x:.2f}"
+        lines = []
+        lines.append(f"=== {ticker} — Present Pattern Director ({self.period}, {self.interval}) ===")
+        lines.append(f"[{best.date.date()}] {best.pattern} ({best.state}) -> {best.status} | {best.notes}")
+        lines.append(f"  Entry : {f(best.entry)}")
+        lines.append(f"  Stop  : {f(best.stop)}")
+        lines.append(f"  Target: {f(best.target)}")
+        if best.entry and best.stop:
+            lines.append(f"  Buffers -> ATR14={last_atr:.2f}, min_pct_buffer={self.pct_buf*100:.2f}% (use >= {buff:.2f})")
+        wt = self._watch_text(best)
+        if wt:
+            lines.append(f"  {wt}")
+
+        # bullets (actionable only)
+        for p in actionable_charts:
+            lines.append(f"  • {p.pattern} {p.state} {p.status} entry={f(p.entry)} stop={f(p.stop)}")
+        for c in actionable_candles:
+            lines.append(f"  • Candle {c.pattern} {c.state} {c.status} ({c.notes})")
+        side150, last_cross_date, last_cross_dir, dist_pct = self._sma150_info(df)
+        if side150 != "unknown":
+            cross_txt = ""
+            if last_cross_date is not None:
+                cross_txt = f", last {last_cross_dir} {(df.index[-1]-last_cross_date).days}d ago"
+            lines.append(f"  SMA150: {side150} ({dist_pct:+.1f}%)" + cross_txt)
+        return "\n".join(lines)
+
+
+    def _sma150_info(self, df: pd.DataFrame):
+        if "sma150" not in df.columns:
+            return "unknown", None, None, float("nan")
+
+        # Force 1-D Series (squeeze handles the 250x1 case)
+        close = df["close"]
+        if isinstance(close, pd.DataFrame):
+            close = close.squeeze("columns")
+
+        sma = df["sma150"]
+        if isinstance(sma, pd.DataFrame):
+            # if there is exactly one column under that name, pick it
+            sma = sma.squeeze("columns")
+
+        # Align indices before any arithmetic/comparisons
+        close, sma = close.align(sma, join="inner")
+
+        if close.empty or sma.empty or pd.isna(sma.iloc[-1]):
+            return "unknown", None, None, float("nan")
+
+        side = "above" if close.iloc[-1] > sma.iloc[-1] else ("below" if close.iloc[-1] < sma.iloc[-1] else "at")
+        dist_pct = 100.0 * (close.iloc[-1] - sma.iloc[-1]) / max(sma.iloc[-1], 1e-9)
+
+        above = close > sma
+        cross_up   = above & (~above.shift(1).fillna(False))
+        cross_down = (~above) & (above.shift(1).fillna(False))
+        last_up   = cross_up[cross_up].index.max() if cross_up.any() else None
+        last_down = cross_down[cross_down].index.max() if cross_down.any() else None
+
+        last_dir, last_date = None, None
+        if last_up is not None or last_down is not None:
+            if last_down is None or (last_up is not None and last_up > last_down):
+                last_dir, last_date = "cross_up", last_up
+            else:
+                last_dir, last_date = "cross_down", last_down
+
+        return side, last_date, last_dir, float(dist_pct)
 
 
     # --------------- Utilities ---------------
@@ -273,29 +389,28 @@ class PatternDirector:
         c_o = self._val(cur["open"]);   c_c = self._val(cur["close"])
         return (p_c > p_o) and (c_c < c_o) and (c_o >= p_c) and (c_c <= p_o)
 
-    def _latest_candle_plan(self, df: pd.DataFrame) -> List["PatternDirector.Plan"]:
+    def _latest_candle_plan(self, df: pd.DataFrame) -> Tuple[List["PatternDirector.Plan"], List["PatternDirector.Plan"]]:
         plans: List["PatternDirector.Plan"] = []
+        bears_info: List["PatternDirector.Plan"] = []
         if len(df) < 6:
-            return plans
+            return plans, bears_info
 
         last_close = self._val(df["close"].iloc[-1])
 
         def add(name: str, side: str, hi: float, lo: float, date, note=""):
-            if not self._allow(side):            # ⬅️ skip short signals
-                return
-            if side == "bear":
-                cancel_now = last_close > hi
-            elif side == "bull":
-                cancel_now = last_close < lo
-            else:
-                cancel_now = False
-            status = "CANCELED NOW" if cancel_now else "VALID"
+            is_today = (date == df.index[-1])
+            cancel_now = (last_close > hi) if side == "bear" else ((last_close < lo) if side == "bull" else False)
+            status = self._status_for_signal(cancel_now, signal_is_today=is_today)
             stop = lo if side == "bull" else (hi if side == "bear" else None)
-            plans.append(self.Plan(
-                pattern=name, side=side, state="CANDLE", date=date,
-                entry=None, stop=float(stop) if stop is not None else None, target=None,
-                cancel_now=cancel_now, status=status, notes=note
-            ))
+            plan = self.Plan(name, side, "CANDLE", date, None,
+                            float(stop) if stop is not None else None,
+                            None, cancel_now, status, note)
+            # route bears into awareness bucket when long_only=True
+            if side == "bear" and self.long_only:
+                if self.show_bearish_info:
+                    bears_info.append(plan)
+            else:
+                plans.append(plan)
 
         # use the last 5 bars: p4,p3,p2,p1,cur
         p4, p3, p2, p1, cur = [df.iloc[-5+i] for i in range(5)]
@@ -333,15 +448,21 @@ class PatternDirector:
                     cancel_now=cancel_now, status=status, notes="2-bar"
                 ))
             elif self._is_bear(cur["open"], cur["close"]):
-                # skip if long-only, or implement symmetric short logic
-                if self._allow("bear"):
-                    add("Bearish Inside (Harami)","bear",
-                        self._val(prev["high"]), self._val(prev["low"]),
-                        df.index[-1], "2-bar")
+                add("Bearish Inside (Harami)","bear",
+                    self._val(prev["high"]), self._val(prev["low"]),
+                    df.index[-1], "2-bar")
 
 
         if self._is_bullish_harami(prev, cur):
-            add("Bullish Harami","bull", self._val(prev["high"]), self._val(prev["low"]), df.index[-1], "2-bar")
+            hi  = self._val(cur["high"])
+            lo  = self._val(cur["low"])
+            atr = self._val(df["atr14"].iloc[-1])
+            ref = self._val(cur["close"])
+            e, s, t = self._levels_for_inside_bullish(hi, lo, atr, ref)  # reuse
+            cancel_now = last_close < lo
+            status = self._status_for_signal(cancel_now, signal_is_today=True)
+            plans.append(self.Plan("Bullish Harami", "bull", "CANDLE",
+                                df.index[-1], e, s, t, cancel_now, status, "2-bar"))
         if self._is_bearish_harami(prev, cur):
             add("Bearish Harami","bear", self._val(prev["high"]), self._val(prev["low"]), df.index[-1], "2-bar")
 
@@ -383,13 +504,13 @@ class PatternDirector:
             lo = min(self._val(p4["low"]), self._val(cur["low"]))
             add("Falling Three Methods","bear", hi, lo, df.index[-1], "5-bar")
 
-        return plans
+        return plans, bears_info
 
     # --------------- Chart pattern detectors ---------------
 
     def _detect_cup_and_handle(self,
                                df: pd.DataFrame,
-                               lookback: int = 100,
+                               lookback: int = 150,
                                min_depth: float = 0.12,
                                max_handle_depth: float = 0.10) -> Optional[Plan]:
         section = df.iloc[-lookback:].copy()
@@ -591,6 +712,22 @@ class PatternDirector:
 
         price = self._val(df["close"].iloc[-1])
         atr   = self._val(df["atr14"].iloc[-1])
+
+        # --- SMA150 trend filter (optional) ---
+        side150, last_cross_date, last_cross_dir, _ = self._sma150_info(df)
+
+        if plan.side == "bull" and self.require_above_sma150_for_longs and side150 != "above":
+            return (False, f"sma150_{side150}")
+
+        if plan.side == "bear" and self.require_below_sma150_for_shorts and side150 != "below":
+            return (False, f"sma150_{side150}")
+
+        if self.sma150_recent_cross_days > 0:
+            if last_cross_date is None:
+                return (False, "sma150_no_cross")
+            days_ago = (df.index[-1] - last_cross_date).days
+            if days_ago > self.sma150_recent_cross_days:
+                return (False, f"sma150_cross_older({days_ago}d)")
 
         # --- helper: momentum pass for bullish-only plans ---
         def bullish_momentum_ok() -> Tuple[bool, str]:
