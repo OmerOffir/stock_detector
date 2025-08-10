@@ -3,7 +3,7 @@ import asyncio
 from zoneinfo import ZoneInfo  # Python 3.9+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-
+from datetime import datetime, timedelta
 from bots.pattern_detector_bot import BotPatternDetector
 
 
@@ -32,9 +32,25 @@ class BotManager:
             coalesce=True             # collapse missed runs into one
         )
 
+    def _fmt_tdelta(self, td: timedelta) -> str:
+        secs = int(max(td.total_seconds(), 0))
+        h, r = divmod(secs, 3600)
+        m, s = divmod(r, 60)
+        if h: return f"{h}h {m}m {s}s"
+        if m: return f"{m}m {s}s"
+        return f"{s}s"
+
     def start(self):
         self.schedule_jobs()
         self.scheduler.start()
+
+        # print next run for the pattern bot
+        job = self.scheduler.get_job("pattern_daily")
+        if job and job.next_run_time:
+            nxt = job.next_run_time.astimezone(self.tz)
+            now = datetime.now(self.tz)
+            print(f"[pattern_bot] next run at {nxt:%Y-%m-%d %H:%M %Z} "
+                  f"(in {self._fmt_tdelta(nxt - now)})")
 
     async def run_forever(self):
         """Only needed if you don't already have a Discord client loop running."""
