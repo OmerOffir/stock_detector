@@ -95,7 +95,19 @@ class PatternDirector:
             chart_plans: List[PatternDirector.Plan] = []
             bear_chart_info: List[PatternDirector.Plan] = []
 
-            for detector in (self._detect_cup_and_handle, self._detect_double_bottom, self._detect_head_and_shoulders):
+            for detector in (
+                self._detect_cup_and_handle,
+                self._detect_double_bottom,
+                self._detect_head_and_shoulders,
+                self._detect_double_top,
+                self._detect_triple_bottom,
+                self._detect_ascending_triangle,
+                self._detect_descending_triangle,
+                self._detect_symmetrical_triangle,
+                # flags (bull/bear)
+                lambda df: self._detect_flag(df, side="bull"),
+                (lambda df: None) if self.long_only else (lambda df: self._detect_flag(df, side="bear")),
+                ):
                 plan = detector(df)
                 if not plan:
                     continue
@@ -806,6 +818,297 @@ class PatternDirector:
         notes = f"LS={LS:.2f} HEAD={HEAD:.2f} RS={RS:.2f}"
         return self.Plan("Head & Shoulders", "bear", state, section.index[-1], float(entry), float(stop),
                          float(target), cancel_now, status, notes)
+    
+    def _detect_double_top(self, df: pd.DataFrame,
+        lookback: int = 120, tol: float = 0.01) -> Optional[Plan]:
+        section = df.iloc[-lookback:].copy()
+        highs = section["high"].to_numpy()
+        closes = section["close"].to_numpy()
+        atr14 = float(section["atr14"].iloc[-1])
+        last_close = float(closes[-1])
+
+        piv = self._swing_highs(highs, w=3)
+        if len(piv) < 2: return None
+        i1, i2 = piv[-2], piv[-1]
+        t1, t2 = float(highs[i1]), float(highs[i2])
+        if not self._percent_eq(t1, t2, tol): return None
+
+        neckline = float(section["low"].iloc[i1:i2+1].min())
+        entry = neckline      # breakdown
+        stop  = max(t1, t2)
+        target = entry - (stop - entry)  # measured move ~ height
+
+        if last_close < entry:
+            buff = max(atr14, entry*0.0025)
+            cancel_now = last_close > (entry + 0.25*buff)
+            status, state = ("CANCELED NOW" if cancel_now else "VALID", "BREAKOUT")
+        else:
+            cancel_now = last_close > stop
+            status, state = ("CANCELED NOW" if cancel_now else "PENDING", "PRE_BREAKOUT")
+
+        notes = f"tops≈equal ({t1:.2f}/{t2:.2f}) | {self._trend_context(df)}"
+        return self.Plan("Bearish Double Top", "bear", state, section.index[-1],
+                        float(entry), float(stop), float(target), cancel_now, status, notes)
+
+
+    def _detect_triple_bottom(self, df: pd.DataFrame,
+                            lookback: int = 150, tol: float = 0.012) -> Optional[Plan]:
+        section = df.iloc[-lookback:].copy()
+        lows = section["low"].to_numpy()
+        highs = section["high"].to_numpy()
+        closes = section["close"].to_numpy()
+        atr14 = float(section["atr14"].iloc[-1])
+        last_close = float(closes[-1])
+
+        piv = self._swing_lows(lows, w=3)
+        if len(piv) < 3: return None
+        i1, i2, i3 = piv[-3], piv[-2], piv[-1]
+        b1, b2, b3 = float(lows[i1]), float(lows[i2]), float(lows[i3])
+        if not (self._percent_eq(b1,b2,tol) and self._percent_eq(b2,b3,tol)): return None
+
+        rim = float(highs[i1:i3+1].max())
+        entry = rim
+        stop  = min(b1,b2,b3)
+        target = entry + (entry - stop)
+
+        if last_close > entry:
+            buff = max(atr14, entry*0.0025)
+            cancel_now = last_close < (entry - 0.25*buff)
+            status, state = ("CANCELED NOW" if cancel_now else "VALID", "BREAKOUT")
+        else:
+            cancel_now = last_close < stop
+            status, state = ("CANCELED NOW" if cancel_now else "PENDING", "PRE_BREAKOUT")
+
+        notes = f"bottoms≈equal ({b1:.2f}/{b2:.2f}/{b3:.2f}) | {self._trend_context(df)}"
+        return self.Plan("Bullish Triple Bottom", "bull", state, section.index[-1],
+                        float(entry), float(stop), float(target), cancel_now, status, notes)
+
+    def _detect_ascending_triangle(self, df: pd.DataFrame,
+                                lookback: int = 120, tol: float = 0.01,
+                                min_rr: float = None) -> Optional["PatternDirector.Plan"]:
+        section = df.iloc[-lookback:].copy()
+        highs = section["high"].to_numpy()
+        lows  = section["low"].to_numpy()
+        closes = section["close"].to_numpy()
+        i_last = section.index[-1]
+        last_close = float(closes[-1])
+        atr14 = float(section["atr14"].iloc[-1])
+
+        ups = self._swing_highs(highs, 3)
+        dns = self._swing_lows(lows, 3)
+        if len(ups) < 2 or len(dns) < 2:
+            return None
+
+        # flat top (equal highs) + rising lows
+        ht = float(np.median([highs[i] for i in ups[-min(3,len(ups)):]]))
+        near_flat = all(self._percent_eq(ht, float(highs[i]), tol) for i in ups[-2:])
+        rising = lows[dns[-1]] > lows[dns[-2]]
+        if len(dns) >= 3:
+            rising = rising and (lows[dns[-2]] > lows[dns[-3]])
+        if not (near_flat and rising):
+            return None
+
+        # levels
+        last_swing_low = float(lows[dns[-1]])                  # tighter stop anchor
+        pattern_low    = float(min(lows[d] for d in dns[-3:])) # for measured move
+        height         = max(ht - pattern_low, 1e-9)
+
+        # buffers
+        buf = max(atr14 * self.atr_mult, ht * self.pct_buf)
+        entry  = ht + 0.25 * buf
+        stop   = last_swing_low - 0.25 * buf                    # tighter than using min of 3
+        target = entry + height                                  # measured‑move target
+
+        # state / status
+        if last_close > entry:
+            cancel_now = last_close < (entry - 0.25 * buf)
+            status, state = ("CANCELED NOW" if cancel_now else "VALID", "BREAKOUT")
+        else:
+            cancel_now = last_close < stop
+            status, state = ("CANCELED NOW" if cancel_now else "PENDING", "PRE_BREAKOUT")
+
+        # enforce a minimum RR (use config’s min_rr_ok unless overridden)
+        rr_needed = self.min_rr_ok if min_rr is None else float(min_rr)
+        risk   = max(entry - stop, 1e-9)
+        reward = target - entry
+        rr_val = reward / risk
+        if rr_val < rr_needed:
+            return None  # or: target = entry + rr_needed * risk
+
+        notes = f"Ascending Triangle | RR={rr_val:.2f}R | {self._trend_context(df)}"
+        return self.Plan("Ascending Triangle", "bull", state, i_last,
+                        float(entry), float(stop), float(target), cancel_now, status, notes)
+
+
+    def _detect_descending_triangle(self, df: pd.DataFrame,
+                                    lookback: int = 120, tol: float = 0.01) -> Optional[Plan]:
+        section = df.iloc[-lookback:].copy()
+        highs = section["high"].to_numpy()
+        lows  = section["low"].to_numpy()
+        closes = section["close"].to_numpy()
+        last_close = float(closes[-1])
+        atr14 = float(section["atr14"].iloc[-1])
+
+        ups = self._swing_highs(highs, 3)
+        dns = self._swing_lows(lows, 3)
+        if len(ups) < 2 or len(dns) < 2: return None
+        lb = float(np.median(lows[dns[-3:]])) if len(dns)>=3 else float(np.mean(lows[dns[-2:]]))
+        falling = highs[ups[-1]] < highs[ups[-2]] and (len(ups)<3 or highs[ups[-2]] < highs[ups[-3]])
+        near_flat = all(self._percent_eq(lb, float(lows[i]), tol) for i in dns[-2:])
+
+        if not (near_flat and falling): return None
+
+        entry = lb
+        stop  = float(max(highs[u] for u in ups[-3:]))
+        target = entry - (stop - entry)
+
+        if last_close < entry:
+            buff = max(atr14, entry*0.0025)
+            cancel_now = last_close > (entry + 0.25*buff)
+            status, state = ("CANCELED NOW" if cancel_now else "VALID", "BREAKOUT")
+        else:
+            cancel_now = last_close > stop
+            status, state = ("CANCELED NOW" if cancel_now else "PENDING", "PRE_BREAKOUT")
+
+        notes = f"Descending Triangle | {self._trend_context(df)}"
+        return self.Plan("Descending Triangle", "bear", state, section.index[-1],
+                        float(entry), float(stop), float(target), cancel_now, status, notes)
+
+
+    def _detect_symmetrical_triangle(self, df: pd.DataFrame,
+                                    lookback: int = 120) -> Optional[Plan]:
+        section = df.iloc[-lookback:].copy()
+        highs = section["high"].to_numpy()
+        lows  = section["low"].to_numpy()
+        closes = section["close"].to_numpy()
+        atr14 = float(section["atr14"].iloc[-1])
+        last_close = float(closes[-1])
+
+        ups = self._swing_highs(highs, 3)
+        dns = self._swing_lows(lows, 3)
+        if len(ups) < 2 or len(dns) < 2: return None
+        contracting = highs[ups[-1]] < highs[ups[-2]] and lows[dns[-1]] > lows[dns[-2]]
+        if not contracting: return None
+
+        top = float(max(highs[ups[-1]], highs[ups[-2]]))
+        bot = float(min(lows[dns[-1]], lows[dns[-2]]))
+        mid = (top + bot)/2
+
+        # Direction preference by prior trend; otherwise choose by where price breaks
+        side_pref = self._prior_trend(df)
+        if last_close > mid:
+            entry = top; stop = bot; target = entry + (entry - stop); side = "bull"
+            if last_close > entry:
+                buff = max(atr14, entry*0.0025)
+                cancel_now = last_close < (entry - 0.25*buff)
+                status, state = ("CANCELED NOW" if cancel_now else "VALID", "BREAKOUT")
+            else:
+                cancel_now = last_close < stop
+                status, state = ("CANCELED NOW" if cancel_now else "PENDING", "PRE_BREAKOUT")
+        else:
+            entry = bot; stop = top; target = entry - (stop - entry); side = "bear"
+            if last_close < entry:
+                buff = max(atr14, entry*0.0025)
+                cancel_now = last_close > (entry + 0.25*buff)
+                status, state = ("CANCELED NOW" if cancel_now else "VALID", "BREAKOUT")
+            else:
+                cancel_now = last_close > stop
+                status, state = ("CANCELED NOW" if cancel_now else "PENDING", "PRE_BREAKOUT")
+
+        notes = f"Symmetrical Triangle ({side_pref}) | {self._trend_context(df)}"
+        return self.Plan("Symmetrical Triangle", side, state, section.index[-1],
+                        float(entry), float(stop), float(target), cancel_now, status, notes)
+
+
+    def _detect_flag(self, df: pd.DataFrame,
+                    lookback: int = 60, min_pole_pct: float = 0.05,
+                    max_pullback_pct: float = 0.5, side: str = "bull") -> Optional[Plan]:
+        """Very simple flag: sharp pole, then 5–20 bars drifting counter‑trend in a tight channel."""
+        section = df.iloc[-lookback:].copy()
+        close = section["close"].to_numpy()
+        high  = section["high"].to_numpy()
+        low   = section["low"].to_numpy()
+        atr14 = float(section["atr14"].iloc[-1])
+
+        n = len(section)
+        if n < 25: return None
+        # pole = last 10–15 bars momentum
+        win = 12
+        pole_ret = (close[-1-win] - close[-1]) / max(close[-1],1e-9) if side=="bear" else (close[-1] - close[-1-win]) / max(close[-1-win],1e-9)
+        if pole_ret < min_pole_pct: return None
+
+        # consolidation window
+        cons = section.iloc[-8:]  # last ~8 bars channel
+        cons_hi = float(cons["high"].max()); cons_lo = float(cons["low"].min())
+        tight = (cons_hi - cons_lo)/max(close[-1],1e-9) < 0.03
+        if not tight: return None
+
+        if side == "bull":
+            entry = cons_hi
+            stop  = cons_lo
+            target = entry + 2*(entry - stop)
+            last_close = float(close[-1])
+            if last_close > entry:
+                buff = max(atr14, entry*0.0025)
+                cancel_now = last_close < (entry - 0.25*buff)
+                status, state = ("CANCELED NOW" if cancel_now else "VALID", "BREAKOUT")
+            else:
+                cancel_now = last_close < stop
+                status, state = ("CANCELED NOW" if cancel_now else "PENDING", "PRE_BREAKOUT")
+            name = "Bullish Flag Pattern"
+            side_out = "bull"
+        else:
+            entry = cons_lo
+            stop  = cons_hi
+            target = entry - 2*(stop - entry)
+            last_close = float(close[-1])
+            if last_close < entry:
+                buff = max(atr14, entry*0.0025)
+                cancel_now = last_close > (entry + 0.25*buff)
+                status, state = ("CANCELED NOW" if cancel_now else "VALID", "BREAKOUT")
+            else:
+                cancel_now = last_close > stop
+                status, state = ("CANCELED NOW" if cancel_now else "PENDING", "PRE_BREAKOUT")
+            name = "Bearish Flag Pattern"
+            side_out = "bear"
+
+        notes = f"Flag ({side}) | {self._trend_context(df)}"
+        return self.Plan(name, side_out, state, section.index[-1],
+                        float(entry), float(stop), float(target), cancel_now, status, notes)
+
+
+
+
+    def _prior_trend(self, df: pd.DataFrame, lookback: int = 30) -> str:
+        """Crude trend: compare last close vs close N bars ago."""
+        if len(df) < lookback+1: return "unknown"
+        a = float(df["close"].iloc[-lookback-1])
+        b = float(df["close"].iloc[-1])
+        return "up" if b > a*1.03 else ("down" if b < a*0.97 else "side")
+
+    def _swing_highs(self, arr: np.ndarray, w: int = 3) -> List[int]:
+        return [i for i in range(w, len(arr)-w)
+                if arr[i] == max(arr[i-w:i+w+1]) and arr[i] > arr[i-1] and arr[i] > arr[i+1]]
+
+    def _swing_lows(self, arr: np.ndarray, w: int = 3) -> List[int]:
+        return [i for i in range(w, len(arr)-w)
+                if arr[i] == min(arr[i-w:i+w+1]) and arr[i] < arr[i-1] and arr[i] < arr[i+1]]
+
+    def _percent_eq(self, a: float, b: float, tol: float = 0.01) -> bool:
+        """Are a and b within tol (1% default)?"""
+        m = (abs(a)+abs(b))/2 or 1.0
+        return abs(a-b)/m <= tol
+
+    def _rr_levels_from_breakout(self, entry, stop, target_mult=2.0) -> Tuple[float,float,float]:
+        """Risk = |entry-stop|; target = entry +/− target_mult*Risk (bull/bear set by caller)."""
+        risk = max(abs(entry - stop), 1e-9)
+        # caller chooses direction when computing target
+        return float(entry), float(stop), float(risk), float(target_mult*risk)
+
+
+
+
+
 
     # --------------- Planner ---------------
 
