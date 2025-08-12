@@ -80,6 +80,11 @@ class PatternDirector:
         self.require_below_sma150_for_shorts = bool(cfg.get("require_below_sma150_for_shorts", False))
         self.sma150_recent_cross_days = int(cfg.get("sma150_recent_cross_days", 0))
 
+        thrust = cfg.get("thrust", {})
+        self.thrust_min_atr_mult = float(thrust.get("min_atr_mult", 1.0))
+        self.thrust_min_body_ratio = float(thrust.get("min_body_ratio", 0.6))
+        self.thrust_min_close_pos  = float(thrust.get("min_close_pos", 0.8))
+
     # --------------- Public API ---------------
 
     def run(self, include_report: bool = True) -> Dict[str, Dict]:
@@ -478,7 +483,8 @@ class PatternDirector:
 
             cancel_now = last_close < lo
             status = self._status_for_signal(cancel_now, signal_is_today=(date == df.index[-1]))
-            return self.Plan("Bullish Engulfing", "bull", "CANDLE", date, e, s, t, cancel_now, status, "2-bar")
+            ctx = self._trend_context(df)
+            return self.Plan("Bullish Engulfing", "bull", "CANDLE", date, e, s, t, cancel_now, status, f"2-bar | {ctx}")
 
 
 
@@ -495,7 +501,8 @@ class PatternDirector:
 
         cancel_now = last_close < lo
         status = self._status_for_signal(cancel_now, signal_is_today=(date == df.index[-1]))
-        return self.Plan("Doji Breakout", "bull", "CANDLE", date, entry, stop, target, cancel_now, status, "single")
+        ctx = self._trend_context(df)
+        return self.Plan("Doji Breakout", "bull", "CANDLE", date, entry, stop, target, cancel_now, status, f"single | {ctx}")
 
 
     def _latest_candle_plan(self, df: pd.DataFrame) -> Tuple[List["PatternDirector.Plan"], List["PatternDirector.Plan"]]:
@@ -541,6 +548,9 @@ class PatternDirector:
 
             if self._is_bearish_engulfing(prv, row):
                 add("Bearish Engulfing","bear", h,l,date,"2-bar")
+
+            if self._is_bullish_thrust(row, df):
+                plans.append(self._bullish_thrust_plan(row, date, df, last_close))
 
         if self._is_inside_bar(prev, cur):
             if self._is_bull(cur["open"], cur["close"]):
@@ -601,10 +611,10 @@ class PatternDirector:
             lo = min(self._val(p2["low"]),  self._val(cur["low"]))
             add("Evening Star","bear", hi, lo, df.index[-1], "3-bar")
 
-        if self._is_three_inside_up(p1, cur, df.iloc[-1] if len(df) >= 3 else cur):
+        if self._is_three_inside_up(p2, p1, cur):
             add("Three Inside Up","bull", self._val(p1["high"]), self._val(p1["low"]), df.index[-1], "3-bar")
 
-        if self._is_three_inside_down(p1, cur, df.iloc[-1] if len(df) >= 3 else cur):
+        if self._is_three_inside_down(p2, p1, cur):
             add("Three Inside Down","bear", self._val(p1["high"]), self._val(p1["low"]), df.index[-1], "3-bar")
 
         # --- NEW 5-bar continuation (p4,p3,p2,p1,cur) ---
@@ -621,6 +631,38 @@ class PatternDirector:
         return plans, bears_info
 
     # --------------- Chart pattern detectors ---------------
+
+    def _is_bullish_thrust(self, row: pd.Series, df: pd.DataFrame,
+                        min_atr_mult: float = 1.0,
+                        min_body_ratio: float = 0.6,
+                        min_close_pos: float = 0.8) -> bool:
+        o, h, l, c = map(self._val, (row["open"], row["high"], row["low"], row["close"]))
+        rng  = max(h - l, 1e-9)
+        body = abs(c - o)
+        # position of close within the bar: 0=low, 1=high
+        close_pos = (c - l) / rng
+        atr_now = float(df["atr14"].loc[row.name])
+        if not np.isfinite(atr_now) or atr_now <= 0:
+            return False
+
+        return (c > o) and (rng >= self.thrust_min_atr_mult * atr_now) and \
+            (body / rng >= self.thrust_min_body_ratio) and (close_pos >= self.thrust_min_close_pos)
+
+    def _bullish_thrust_plan(self, row: pd.Series, date, df: pd.DataFrame, last_close: float) -> "PatternDirector.Plan":
+        hi  = self._val(row["high"])
+        lo  = self._val(row["low"])
+        atr = float(df["atr14"].loc[date])
+        ref = self._val(row["close"])
+
+        entry, stop, target = self._levels_for_inside_bullish(hi, lo, atr, ref, r_mult=2.0, atr_buf_mult=0.25)
+        cancel_now = last_close < lo
+        status = self._status_for_signal(cancel_now, signal_is_today=(date == df.index[-1]))
+
+        ctx = self._trend_context(df)
+        return self.Plan("Bullish Thrust (Marubozu)", "bull", "CANDLE",
+                    date, entry, stop, target, cancel_now, status, f"single-strong | {ctx}")
+
+
 
     def _detect_cup_and_handle(self,
                                df: pd.DataFrame,
@@ -673,6 +715,14 @@ class PatternDirector:
         notes = f"depth={depth:.1%}, handle_depth={handle_depth:.1%}"
         return self.Plan("Cup & Handle", "bull", state, section.index[-1], float(entry), float(stop),
                          float(target), cancel_now, status, notes)
+
+    def _trend_context(self, df: pd.DataFrame) -> str:
+        side, _, _, _ = self._sma150_info(df)
+        # slope of SMA150 last 5 bars
+        s = df["sma150"].diff().rolling(5).mean().iloc[-1]
+        if side == "above" and s > 0: return "continuation"
+        if side == "below" and s < 0: return "continuation"
+        return "reversal"
 
     def _detect_double_bottom(self,
                               df: pd.DataFrame,
