@@ -353,8 +353,16 @@ class PatternDirector:
         # bullets (actionable only)
         for p in actionable_charts:
             lines.append(f"  • {p.pattern} {p.state} {p.status} entry={f(p.entry)} stop={f(p.stop)}")
+            nxt = self._next_step_text(p, price_now)
+            if nxt:
+                lines.append(f"     ↳ Next: {nxt}")
+
         for c in actionable_candles:
             lines.append(f"  • Candle {c.pattern} {c.state} {c.status} ({c.notes})")
+            nxt = self._next_step_text(c, price_now)
+            if nxt:
+                lines.append(f"     ↳ Next: {nxt}")
+
         side150, last_cross_date, last_cross_dir, dist_pct = self._sma150_info(df)
         if side150 != "unknown":
             cross_txt = ""
