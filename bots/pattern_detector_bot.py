@@ -1,7 +1,7 @@
 import sys; sys.path.append(".")
 import pandas as pd
 from pattern_detectort.pattern_detecto import PatternDirector
-from discord.discord_notifier import DiscordNotifier
+from discord_stock.discord_notifier import DiscordNotifier
 
 class BotPatternDetector:
     def __init__(self):
