@@ -1,6 +1,6 @@
 import sys; sys.path.append(".")
 import pandas as pd
-
+from pathlib import Path
 from pattern_detectort.pattern_detecto import PatternDirector
 from discord_stock.discord_notifier import DiscordNotifier
 from graph_maker.candlestick_plotter import CandlestickPlotter   # <- import your plotter
@@ -10,6 +10,31 @@ class BotPatternDetector:
         self.pattern_driver = PatternDirector()
         self.discord_notifier = DiscordNotifier()
         self.plotter = CandlestickPlotter()  # <- init once
+
+    def clean_images_folder(self, folder_path: str):
+        """
+        Remove all files in the given images folder.
+
+        Args:
+            folder_path (str): Path to the folder containing images.
+        """
+        folder = Path(folder_path)
+        if not folder.exists():
+            print(f"[clean_images_folder] Folder not found: {folder}")
+            return
+
+        removed = 0
+        for file in folder.iterdir():
+            if file.is_file():
+                try:
+                    file.unlink()
+                    removed += 1
+                except Exception as e:
+                    print(f"[clean_images_folder] Failed to delete {file}: {e}")
+
+        print(f"[clean_images_folder] Removed {removed} files from {folder}")
+
+
 
     def _pick_color(self, status: str, state: str) -> int:
         if status == "CANCELED NOW": return 0xE74C3C  # red
@@ -94,6 +119,7 @@ class BotPatternDetector:
                 # Fall back to embed-only if plotting fails
                 embed["description"] += f"\n\n*Chart attachment unavailable ({e}).*"
                 self.discord_notifier.send_embed("detected_stocks", embed)
+        self.clean_images_folder("graph_maker/images")
 
 
 if __name__ == "__main__":
