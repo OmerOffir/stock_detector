@@ -79,6 +79,7 @@ class PatternDirector:
         self.require_above_sma150_for_longs = bool(cfg.get("require_above_sma150_for_longs", False))
         self.require_below_sma150_for_shorts = bool(cfg.get("require_below_sma150_for_shorts", False))
         self.sma150_recent_cross_days = int(cfg.get("sma150_recent_cross_days", 0))
+        self.sma150_near_band_pct = float(cfg.get("sma150_near_band_pct", 5.0))
 
         thrust = cfg.get("thrust", {})
         self.thrust_min_atr_mult = float(thrust.get("min_atr_mult", 1.0))
@@ -107,6 +108,7 @@ class PatternDirector:
                 # flags (bull/bear)
                 lambda df: self._detect_flag(df, side="bull"),
                 (lambda df: None) if self.long_only else (lambda df: self._detect_flag(df, side="bear")),
+                self._detect_near_sma150,
                 ):
                 plan = detector(df)
                 if not plan:
@@ -1163,6 +1165,38 @@ class PatternDirector:
                     print("  Watch: Confirm down next bar; CANCEL NOW if present close > signal high.")
                 else:
                     print("  Note : Doji is neutral; wait for direction.")
+
+    def _detect_near_sma150(self, df: pd.DataFrame, band_pct: float = None) -> Optional["PatternDirector.Plan"]:
+        """
+        Awareness-only signal (treated like a 'pattern'):
+        Fire when last close is within ±band_pct of SMA150.
+        Emits a neutral CANDLE plan (no entry/stop/target).
+        """
+        if "sma150" not in df.columns or df["sma150"].isna().iloc[-1]:
+            return None
+
+        band = self.sma150_near_band_pct if band_pct is None else float(band_pct)
+        side, last_cross_date, last_cross_dir, dist_pct = self._sma150_info(df)
+        if not np.isfinite(dist_pct):
+            return None
+
+        if abs(dist_pct) <= band:
+            # neutral so it shows even in long_only mode and skips momentum gating
+            note = f"{side}; {dist_pct:+.1f}% from SMA150"
+            if last_cross_date is not None:
+                note += f", last {last_cross_dir} {(df.index[-1]-last_cross_date).days}d ago"
+            return self.Plan(
+                pattern=f"Near SMA150 (±{band:.0f}%)",
+                side="neutral",
+                state="CANDLE",
+                date=df.index[-1],
+                entry=None, stop=None, target=None,
+                cancel_now=False,
+                status="VALID",
+                notes=note
+            )
+        return None
+
 
     def _is_actionable_now(self, plan: "PatternDirector.Plan", df: pd.DataFrame) -> Tuple[bool, str]:
         """

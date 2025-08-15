@@ -1,5 +1,6 @@
 import json
 import requests
+import time
 from pathlib import Path
 
 class DiscordNotifier:
@@ -21,11 +22,19 @@ class DiscordNotifier:
         if r.status_code != 204:
             raise Exception(f"Failed to send message: {r.status_code} {r.text}")
 
+
     def send_embed(self, channel_name: str, embed: dict):
-        """Send a single embed (no image)."""
         url = self.webhooks.get(channel_name)
         if not url:
             raise ValueError(f"No webhook URL found for channel '{channel_name}'")
-        r = requests.post(url, json={"embeds": [embed]}, timeout=20)
-        if r.status_code not in (200, 204):
+        
+        while True:
+            r = requests.post(url, json={"embeds": [embed]}, timeout=20)
+            if r.status_code in (200, 204):
+                break
+            if r.status_code == 429:
+                data = r.json()
+                retry = float(data.get("retry_after", 1))
+                time.sleep(retry)
+                continue
             raise Exception(f"Failed to send embed: {r.status_code} {r.text}")
